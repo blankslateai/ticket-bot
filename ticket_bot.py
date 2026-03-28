@@ -26,7 +26,6 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
             cfg = json.load(f)
-        # Fill in any missing keys with defaults
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
         return cfg
@@ -49,6 +48,7 @@ def append_log(channel_name, guild_name, message):
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 client = discord.Client()
+greeted_channels = set()  # Deduplicate — prevent sending hi multiple times per channel
 
 @client.event
 async def on_ready():
@@ -57,7 +57,7 @@ async def on_ready():
 
 @client.event
 async def on_guild_channel_create(channel):
-    cfg = load_config()  # Re-read config on every event so changes apply live
+    cfg = load_config()
 
     if not cfg.get("enabled", True):
         return
@@ -65,6 +65,10 @@ async def on_guild_channel_create(channel):
         return
     if channel.category_id != cfg["category_id"]:
         return
+    if channel.id in greeted_channels:
+        return  # Already greeted, skip duplicate event
+
+    greeted_channels.add(channel.id)
 
     await asyncio.sleep(1.5)
     greeting = cfg.get("greeting", "hi")
