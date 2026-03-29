@@ -1,48 +1,41 @@
 """
 Discord Ticket Bot — Web Control Panel
-Password protected. Run alongside ticket_bot.py.
+Config is stored in memory (no file dependency).
+The bot fetches config from this web process via internal API.
 """
 
 from flask import Flask, jsonify, request, render_template_string, session, redirect
-import json, os, subprocess, sys, threading
+import os, subprocess, sys, threading
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "tbot-s3cr3t-kEy-9z")
 
-CONFIG_FILE = "config.json"
-LOG_FILE    = "logs.json"
-PASSWORD    = os.environ.get("PANEL_PASSWORD", "201203")
+PASSWORD = os.environ.get("PANEL_PASSWORD", "201203")
+
+# ── In-memory config (survives as long as the process is running) ──────────────
+config = {
+    "enabled":     True,
+    "greeting":    os.environ.get("GREETING", "hi"),
+    "category_id": int(os.environ.get("CATEGORY_ID", "1396563397503619113")),
+}
+config_lock = threading.Lock()
+
+logs = []
+logs_lock = threading.Lock()
+MAX_LOGS = 200
 
 bot_process = None
-bot_lock    = threading.Lock()
-
-DEFAULT_CONFIG = {
-    "enabled":     True,
-    "greeting":    "hi",
-    "token":       os.environ.get("DISCORD_TOKEN", ""),
-    "category_id": 1396563397503619113,
-}
+bot_lock = threading.Lock()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
-            cfg = json.load(f)
-        for k, v in DEFAULT_CONFIG.items():
-            cfg.setdefault(k, v)
-        return cfg
-    return DEFAULT_CONFIG.copy()
+def get_config():
+    with config_lock:
+        return dict(config)
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-def load_logs():
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE) as f:
-            return json.load(f)
-    return []
+def update_config(key, value):
+    with config_lock:
+        config[key] = value
 
 def bot_running():
     global bot_process
@@ -59,13 +52,35 @@ def require_auth(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-# ── Auth routes ────────────────────────────────────────────────────────────────
+# ── Internal API (called by ticket_bot.py) ─────────────────────────────────────
+
+@app.route("/internal/config")
+def internal_config():
+    """The bot calls this to get its current config."""
+    token = request.args.get("token")
+    if token != os.environ.get("DISCORD_TOKEN", "")[:8]:
+        return jsonify({"error": "forbidden"}), 403
+    return jsonify(get_config())
+
+@app.route("/internal/log", methods=["POST"])
+def internal_log():
+    """The bot calls this to record a greeted ticket."""
+    token = request.args.get("token")
+    if token != os.environ.get("DISCORD_TOKEN", "")[:8]:
+        return jsonify({"error": "forbidden"}), 403
+    entry = request.get_json() or {}
+    with logs_lock:
+        logs.insert(0, entry)
+        if len(logs) > MAX_LOGS:
+            logs.pop()
+    return jsonify({"ok": True})
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ticket Bot — Login</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>
@@ -94,8 +109,7 @@ LOGIN_HTML = """<!DOCTYPE html>
   </form>
   {% if error %}<div class="err">❌ Wrong password</div>{% endif %}
 </div>
-</body>
-</html>"""
+</body></html>"""
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -112,17 +126,17 @@ def logout():
     session.clear()
     return redirect("/login")
 
-# ── API ────────────────────────────────────────────────────────────────────────
+# ── Panel API ──────────────────────────────────────────────────────────────────
 
 @app.route("/api/status")
 @require_auth
 def status():
-    cfg = load_config()
+    cfg = get_config()
     return jsonify({
         "running":     bot_running(),
-        "enabled":     cfg.get("enabled", True),
-        "greeting":    cfg.get("greeting", "hi"),
-        "category_id": cfg.get("category_id"),
+        "enabled":     cfg["enabled"],
+        "greeting":    cfg["greeting"],
+        "category_id": cfg["category_id"],
     })
 
 @app.route("/api/start", methods=["POST"])
@@ -150,11 +164,11 @@ def stop():
 @app.route("/api/toggle", methods=["POST"])
 @require_auth
 def toggle():
-    cfg = load_config()
-    cfg["enabled"] = not cfg.get("enabled", True)
-    save_config(cfg)
-    state = "enabled" if cfg["enabled"] else "paused"
-    return jsonify({"ok": True, "enabled": cfg["enabled"], "msg": f"Bot {state} (no restart needed)"})
+    cfg = get_config()
+    new_val = not cfg["enabled"]
+    update_config("enabled", new_val)
+    state = "enabled" if new_val else "paused"
+    return jsonify({"ok": True, "enabled": new_val, "msg": f"Bot {state}"})
 
 @app.route("/api/greeting", methods=["POST"])
 @require_auth
@@ -163,9 +177,7 @@ def set_greeting():
     greeting = (data or {}).get("greeting", "").strip()
     if not greeting:
         return jsonify({"ok": False, "msg": "Greeting cannot be empty"})
-    cfg = load_config()
-    cfg["greeting"] = greeting
-    save_config(cfg)
+    update_config("greeting", greeting)
     return jsonify({"ok": True, "msg": f"Greeting saved: {greeting}"})
 
 @app.route("/api/category", methods=["POST"])
@@ -175,21 +187,20 @@ def set_category():
     raw = str((data or {}).get("category_id", "")).strip()
     if not raw.isdigit():
         return jsonify({"ok": False, "msg": "Category ID must be a number"})
-    cfg = load_config()
-    cfg["category_id"] = int(raw)
-    save_config(cfg)
-    return jsonify({"ok": True, "msg": f"Category ID updated to {raw}"})
+    update_config("category_id", int(raw))
+    return jsonify({"ok": True, "msg": f"Category updated to {raw}"})
 
 @app.route("/api/logs")
 @require_auth
-def logs():
-    return jsonify(load_logs())
+def get_logs():
+    with logs_lock:
+        return jsonify(list(logs))
 
 @app.route("/api/clear_logs", methods=["POST"])
 @require_auth
 def clear_logs():
-    with open(LOG_FILE, "w") as f:
-        json.dump([], f)
+    with logs_lock:
+        logs.clear()
     return jsonify({"ok": True})
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
@@ -197,8 +208,7 @@ def clear_logs():
 PANEL_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ticket Bot Panel</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>
@@ -251,21 +261,15 @@ PANEL_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-
 <header>
   <div class="header-left">
     <div class="logo">🎫</div>
-    <div>
-      <h1>Ticket Bot</h1>
-      <div class="subtitle">Control Panel</div>
-    </div>
+    <div><h1>Ticket Bot</h1><div class="subtitle">Control Panel</div></div>
   </div>
   <a href="/logout" class="logout-btn">🔒 Logout</a>
 </header>
 
 <div class="grid">
-
-  <!-- Status & Control -->
   <div class="card">
     <div class="card-title">Bot Status</div>
     <div class="status-row">
@@ -273,11 +277,10 @@ PANEL_HTML = """<!DOCTYPE html>
     </div>
     <div class="btn-row">
       <button class="btn btn-primary" onclick="startBot()">▶ Start</button>
-      <button class="btn btn-danger"  onclick="stopBot()">■ Stop</button>
+      <button class="btn btn-danger" onclick="stopBot()">■ Stop</button>
     </div>
   </div>
 
-  <!-- Toggle -->
   <div class="card">
     <div class="card-title">Auto-Reply Toggle</div>
     <div class="toggle-row">
@@ -292,14 +295,12 @@ PANEL_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Greeting -->
   <div class="card">
     <div class="card-title">Greeting Message</div>
     <input type="text" id="greeting-input" placeholder="hi" />
     <button class="btn btn-primary btn-sm" onclick="saveGreeting()">💾 Save</button>
   </div>
 
-  <!-- Category ID -->
   <div class="card">
     <div class="card-title">Ticket Category ID</div>
     <input type="text" id="category-input" placeholder="e.g. 1396563397503619113" />
@@ -307,24 +308,28 @@ PANEL_HTML = """<!DOCTYPE html>
     <div class="hint">Right-click a category in Discord → Copy ID</div>
   </div>
 
-  <!-- Logs -->
   <div class="card full-width">
     <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
       <span>Ticket Log</span>
       <button class="btn btn-ghost btn-sm" onclick="clearLogs()">🗑 Clear</button>
     </div>
-    <div class="log-list" id="log-list">
-      <div class="empty">No tickets greeted yet.</div>
-    </div>
+    <div class="log-list" id="log-list"><div class="empty">No tickets greeted yet.</div></div>
   </div>
-
 </div>
 <div id="toast"></div>
 
 <script>
-  function toast(msg) {
+  let editing = new Set();
+
+  document.querySelectorAll('input[type=text]').forEach(el => {
+    el.addEventListener('focus', () => editing.add(el.id));
+    el.addEventListener('blur',  () => editing.delete(el.id));
+  });
+
+  function toast(msg, ok=true) {
     const t = document.getElementById('toast');
     t.textContent = msg;
+    t.style.borderColor = ok ? 'var(--accent2)' : 'var(--red)';
     t.classList.add('show');
     setTimeout(() => t.classList.remove('show'), 2800);
   }
@@ -333,11 +338,8 @@ PANEL_HTML = """<!DOCTYPE html>
     const r = await fetch('/api/status');
     if (r.status === 401) { location.href = '/login'; return; }
     const d = await r.json();
-    // Only update inputs if the user isn't currently focused on them
-    const gi = document.getElementById('greeting-input');
-    const ci = document.getElementById('category-input');
-    if (document.activeElement !== gi) gi.value = d.greeting;
-    if (document.activeElement !== ci) ci.value = d.category_id;
+    if (!editing.has('greeting-input')) document.getElementById('greeting-input').value = d.greeting;
+    if (!editing.has('category-input')) document.getElementById('category-input').value = d.category_id;
     document.getElementById('enabled-toggle').checked = d.enabled;
     const pill = document.getElementById('status-pill');
     const txt  = document.getElementById('status-text');
@@ -361,34 +363,36 @@ PANEL_HTML = """<!DOCTYPE html>
 
   async function startBot() {
     const d = await (await fetch('/api/start',{method:'POST'})).json();
-    toast(d.msg); fetchStatus();
+    toast(d.msg, d.ok); fetchStatus();
   }
   async function stopBot() {
     const d = await (await fetch('/api/stop',{method:'POST'})).json();
-    toast(d.msg); fetchStatus();
+    toast(d.msg, d.ok); fetchStatus();
   }
   async function toggleEnabled() {
     const d = await (await fetch('/api/toggle',{method:'POST'})).json();
-    toast(d.msg); fetchStatus();
+    toast(d.msg, d.ok); fetchStatus();
   }
   async function saveGreeting() {
     const greeting = document.getElementById('greeting-input').value.trim();
-    if (!greeting) { toast('Greeting cannot be empty'); return; }
+    if (!greeting) { toast('Greeting cannot be empty', false); return; }
     const d = await (await fetch('/api/greeting',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({greeting})
     })).json();
-    toast(d.msg);
+    toast(d.msg, d.ok);
+    await fetchStatus();
   }
   async function saveCategory() {
     const category_id = document.getElementById('category-input').value.trim();
-    if (!category_id) { toast('Category ID cannot be empty'); return; }
-    if (!/^\d+$/.test(category_id)) { toast('Category ID must be a number'); return; }
+    if (!category_id) { toast('Category ID cannot be empty', false); return; }
+    if (!/^\d+$/.test(category_id)) { toast('Must be a number', false); return; }
     const d = await (await fetch('/api/category',{
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({category_id: parseInt(category_id)})
     })).json();
-    toast(d.msg);
+    toast(d.msg, d.ok);
+    await fetchStatus();
   }
   async function clearLogs() {
     await fetch('/api/clear_logs',{method:'POST'});
@@ -396,11 +400,10 @@ PANEL_HTML = """<!DOCTYPE html>
   }
 
   fetchStatus(); fetchLogs();
-  setInterval(fetchStatus, 4000);
-  setInterval(fetchLogs,   4000);
+  setInterval(fetchStatus, 5000);
+  setInterval(fetchLogs, 5000);
 </script>
-</body>
-</html>"""
+</body></html>"""
 
 @app.route("/")
 @require_auth
