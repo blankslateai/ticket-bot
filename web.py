@@ -333,8 +333,11 @@ PANEL_HTML = """<!DOCTYPE html>
     const r = await fetch('/api/status');
     if (r.status === 401) { location.href = '/login'; return; }
     const d = await r.json();
-    document.getElementById('greeting-input').value = d.greeting;
-    document.getElementById('category-input').value = d.category_id;
+    // Only update inputs if the user isn't currently focused on them
+    const gi = document.getElementById('greeting-input');
+    const ci = document.getElementById('category-input');
+    if (document.activeElement !== gi) gi.value = d.greeting;
+    if (document.activeElement !== ci) ci.value = d.category_id;
     document.getElementById('enabled-toggle').checked = d.enabled;
     const pill = document.getElementById('status-pill');
     const txt  = document.getElementById('status-text');
@@ -383,7 +386,7 @@ PANEL_HTML = """<!DOCTYPE html>
     if (!/^\d+$/.test(category_id)) { toast('Category ID must be a number'); return; }
     const d = await (await fetch('/api/category',{
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({category_id})
+      body: JSON.stringify({category_id: parseInt(category_id)})
     })).json();
     toast(d.msg);
   }
