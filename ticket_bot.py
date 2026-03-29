@@ -1,90 +1,81 @@
 """
 Discord Ticket Auto-Greeter — Bot Process
-Reads config from config.json, logs activity to logs.json
-Controlled by the web panel (web.py)
+Fetches live config from the web panel (web.py) instead of reading a file.
 """
 
 import discord
 import asyncio
-import json
 import os
+import requests
 from datetime import datetime, timezone
 
-CONFIG_FILE = "config.json"
-LOG_FILE = "logs.json"
-MAX_LOGS = 200
+# The web panel runs on the same machine, so we talk to it locally
+PANEL_URL = os.environ.get("PANEL_URL", "http://localhost:8080")
+# Use first 8 chars of the Discord token as a simple internal auth token
+TOKEN = os.environ.get("DISCORD_TOKEN", "")
+INTERNAL_TOKEN = TOKEN[:8] if TOKEN else ""
 
-# ── Defaults (overridden by config.json) ──────────────────────────────────────
-DEFAULT_CONFIG = {
-    "enabled": True,
-    "greeting": "hi",
-    "token": os.environ.get("DISCORD_TOKEN", ""),
-    "category_id": 1396563397503619113,
-}
+def get_config():
+    """Fetch live config from the web panel."""
+    try:
+        r = requests.get(f"{PANEL_URL}/internal/config", params={"token": INTERNAL_TOKEN}, timeout=3)
+        return r.json()
+    except Exception as e:
+        print(f"[BOT] Could not fetch config: {e}")
+        return {"enabled": True, "greeting": "hi", "category_id": 1396563397503619113}
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
-            cfg = json.load(f)
-        for k, v in DEFAULT_CONFIG.items():
-            cfg.setdefault(k, v)
-        return cfg
-    return DEFAULT_CONFIG.copy()
+def post_log(channel_name, guild_name, message):
+    """Send a log entry to the web panel."""
+    try:
+        requests.post(
+            f"{PANEL_URL}/internal/log",
+            params={"token": INTERNAL_TOKEN},
+            json={
+                "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "channel": channel_name,
+                "guild": guild_name,
+                "message": message,
+            },
+            timeout=3,
+        )
+    except Exception as e:
+        print(f"[BOT] Could not post log: {e}")
 
-def append_log(channel_name, guild_name, message):
-    logs = []
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE) as f:
-            logs = json.load(f)
-    logs.insert(0, {
-        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "channel": channel_name,
-        "guild": guild_name,
-        "message": message,
-    })
-    logs = logs[:MAX_LOGS]
-    with open(LOG_FILE, "w") as f:
-        json.dump(logs, f)
-
-# ── Bot ───────────────────────────────────────────────────────────────────────
 client = discord.Client()
-greeted_channels = set()  # Deduplicate — prevent sending hi multiple times per channel
+greeted_channels = set()
 
 @client.event
 async def on_ready():
-    cfg = load_config()
-    print(f"[BOT] Logged in as {client.user} | Category: {cfg['category_id']}")
+    print(f"[BOT] Logged in as {client.user}")
 
 @client.event
 async def on_guild_channel_create(channel):
-    cfg = load_config()
+    cfg = get_config()
 
     if not cfg.get("enabled", True):
         return
     if not isinstance(channel, discord.TextChannel):
         return
-    if channel.category_id != cfg["category_id"]:
+    if channel.category_id != cfg.get("category_id"):
         return
     if channel.id in greeted_channels:
-        return  # Already greeted, skip duplicate event
+        return
 
     greeted_channels.add(channel.id)
-
     await asyncio.sleep(1.5)
+
     greeting = cfg.get("greeting", "hi")
     await channel.send(greeting)
 
     guild_name = channel.guild.name if channel.guild else "Unknown"
-    append_log(channel.name, guild_name, greeting)
+    post_log(channel.name, guild_name, greeting)
     print(f"[BOT] Greeted #{channel.name} in {guild_name}")
 
 def main():
-    cfg = load_config()
-    token = cfg.get("token") or os.environ.get("DISCORD_TOKEN", "")
-    if not token:
-        print("[BOT] ERROR: No Discord token found. Set DISCORD_TOKEN env var or add to config.json")
+    if not TOKEN:
+        print("[BOT] ERROR: No DISCORD_TOKEN set")
         return
-    client.run(token)
+    client.run(TOKEN)
 
 if __name__ == "__main__":
     main()
